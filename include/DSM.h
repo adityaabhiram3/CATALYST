@@ -355,6 +355,9 @@ public:
                  GlobalAddress &leaf);
   int rpc_remove(GlobalAddress start_node, uint64_t k, GlobalAddress &leaf);
 
+  // CATALYST traverse RPC: msg carries the request in, the reply out.
+  void catalyst_traverse(catalyst_wire::TraverseMsg &msg);
+
   void free(GlobalAddress addr);
   void smart_free(const GlobalAddress &addr, int size);
 
@@ -372,6 +375,21 @@ public:
     buffer->app_id = thread_id;
 
     iCon->sendMessage2Dir(buffer, node_id, dir_id);
+  }
+
+  // rpc_call_dir copies sizeof(RawMessage); CATALYST's message is larger, so
+  // it needs its own copy length on both the memcpy and the wire.
+  void rpc_call_dir_sized(const void *m, size_t len, uint16_t node_id,
+                          uint16_t dir_id) {
+#ifdef COUNT_RDMA
+    num_rdma_rpc[getMyThreadID()][0]++;
+    size_rdma_read[getMyThreadID()][0] += len;
+#endif
+    auto buffer = (RawMessage *)iCon->message->getSendPool();
+    memcpy(buffer, m, len);
+    buffer->node_id = myNodeID;
+    buffer->app_id = thread_id;
+    iCon->sendMessage2Dir(buffer, node_id, dir_id, len);
   }
 
   RawMessage *rpc_wait() {
@@ -557,6 +575,27 @@ inline int DSM::rpc_insert(GlobalAddress start_node, uint64_t k, uint64_t value,
   auto mm = rpc_wait();
   leaf_addr = mm->addr;
   return mm->level;
+}
+
+inline void DSM::catalyst_traverse(catalyst_wire::TraverseMsg &msg) {
+  msg.type = RpcType::CATALYST_TRAVERSE;
+  // Only the request half needs to cross; the reply fills in the rest.
+  const size_t req_len = offsetof(catalyst_wire::TraverseMsg, status);
+
+  thread_local uint16_t dir_id = pthread_self() % memThreadCount;
+  this->rpc_call_dir_sized(&msg, req_len, msg.start.nodeID, dir_id);
+  dir_id = (dir_id + 1) % memThreadCount;
+
+  auto *reply = reinterpret_cast<const catalyst_wire::TraverseMsg *>(rpc_wait());
+  msg.status = reply->status;
+  msg.value = reply->value;
+  msg.leaf = reply->leaf;
+  msg.npath = reply->npath;
+  const uint8_t n = reply->npath < catalyst_wire::kMaxPathLen
+                        ? reply->npath
+                        : catalyst_wire::kMaxPathLen;
+  for (uint8_t i = 0; i < n; ++i) msg.path[i] = reply->path[i];
+  msg.npath = n;
 }
 
 inline void DSM::free(GlobalAddress addr) { local_allocator.free(addr); }

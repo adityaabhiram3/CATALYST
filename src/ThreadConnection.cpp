@@ -30,10 +30,10 @@ ThreadConnection::ThreadConnection(uint16_t threadID, void *cachePool,
 }
 
 void ThreadConnection::sendMessage2Dir(RawMessage *m, uint16_t node_id,
-                                       uint16_t dir_id) {
+                                       uint16_t dir_id, size_t len) {
   // printf("Send a message to node %d and dir %d, qpn = %d\n", node_id, dir_id,
   //        remoteInfo[node_id].dirMessageQPN[dir_id]);
   message->sendRawMessage(m, remoteInfo[node_id].dirMessageQPN[dir_id],
-                          remoteInfo[node_id].appToDirAh[threadID][dir_id]);
+                          remoteInfo[node_id].appToDirAh[threadID][dir_id], len);
   // printf("Finish the message send\n");
 }

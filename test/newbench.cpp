@@ -1,6 +1,7 @@
 #include "Timer.h"
 // #include "Tree.h"
 #include "../util/system.hpp"
+#include "catalyst/catalyst_tree.h"
 #include "sherman_wrapper.h"
 #include "smart/smart_wrapper.h"
 #include "tree/leanstore_tree.h"
@@ -368,7 +369,7 @@ void parse_args(int argc, char *argv[]) {
            "warmup_num op_num "
            "check_correctness(0=no, 1=yes) time_based(0=no, "
            "1=yes) early_stop(0=no, 1=yes) "
-           "index(0=cachepush, 1=sherman) rpc_rate admission_rate "
+           "index(0=DEX, 1=sherman, 2=SMART, 3=CATALYST) rpc_rate admission_rate "
            "auto_tune(0=false, 1=true) kMaxThread"
            " \n");
     exit(-1);
@@ -497,6 +498,27 @@ void generate_index() {
   case 2: // SMART
   {
     tree = new smart_wrapper<Key, Value>(dsm, 0, cache_mb);
+  } break;
+
+  case 3: // CATALYST
+  {
+    // Same logical partitioning as DEX, so both see an identical remote tree
+    // and the comparison isolates navigation from caching.
+    int cluster_num = CNodeCount;
+    sharding.push_back(std::numeric_limits<Key>::min());
+    for (int i = 0; i < cluster_num - 1; ++i) {
+      sharding.push_back((threadKSpace * kMaxThread) + sharding[i]);
+    }
+    sharding.push_back(std::numeric_limits<Key>::max());
+    assert(sharding.size() == static_cast<size_t>(cluster_num) + 1);
+
+    catalyst::CursorConfig cfg;
+    // cache_mb is reinterpreted for this index: it sizes the DEX fallback
+    // cache used for bulk load and leaf splits, NOT CATALYST's own state.
+    // The cursor table is fixed at its ~2MB default; see catalyst_tree.h.
+    tree = new catalyst::BTree<Key, Value>(dsm, 0, cache_mb, sharding,
+                                           cluster_num, cfg);
+    partitioned = true;
   } break;
   }
   numa_set_localalloc();

@@ -9,7 +9,7 @@ RawMessageConnection::RawMessageConnection(RdmaContext &ctx, ibv_cq *cq,
 void RawMessageConnection::initSend() {}
 
 void RawMessageConnection::sendRawMessage(RawMessage *m, uint32_t remoteQPN,
-                                          ibv_ah *ah) {
+                                          ibv_ah *ah, size_t len) {
   // I think this is used to dry the queue to avoid the overflow
   // After adding this check, the send queue is at most 32 entries
   // send_cq is different from rpc_cp; rpc_qp is the cp binded to receive queue
@@ -18,8 +18,8 @@ void RawMessageConnection::sendRawMessage(RawMessage *m, uint32_t remoteQPN,
     pollWithCQ(send_cq, 1, &wc);
   }
 
-  rdmaSend(message, (uint64_t)m - sendPadding, sizeof(RawMessage) + sendPadding,
-           messageLkey, ah, remoteQPN, (sendCounter & SIGNAL_BATCH) == 0);
+  rdmaSend(message, (uint64_t)m - sendPadding, len + sendPadding, messageLkey,
+           ah, remoteQPN, (sendCounter & SIGNAL_BATCH) == 0);
 
   ++sendCounter;
 }

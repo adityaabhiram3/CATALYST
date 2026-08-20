@@ -64,6 +64,9 @@ void Directory::dirThread() {
 
 void Directory::process_message(const RawMessage *m) {
   RawMessage *send = nullptr;
+  // CATALYST replies are larger than a RawMessage and variable-length, so the
+  // reply size travels alongside the reply pointer.
+  size_t send_len = sizeof(RawMessage);
   switch (m->type) {
 
   case RpcType::LOOKUP: {
@@ -132,6 +135,33 @@ void Directory::process_message(const RawMessage *m) {
     break;
   }
 
+  /* CATALYST: run the operation from wherever the cursor pointed and hand the
+   * walked path back, so the compute side can install cursors without a
+   * profiling pass or a second round trip (Sec. 4.1, Fig. 8 lines 23-27). */
+  case RpcType::CATALYST_TRAVERSE: {
+    auto *req = reinterpret_cast<const catalyst_wire::TraverseMsg *>(m);
+    auto *resp = reinterpret_cast<catalyst_wire::TraverseMsg *>(
+        dCon->message->getSendPool());
+    resp->type = RpcType::CATALYST_TRAVERSE;
+
+    Value v_out = 0;
+    GlobalAddress leaf = GlobalAddress::Null();
+    uint8_t npath = 0;
+    resp->status = cachepush::catalyst_traverse(
+        req->start, remoteInfo[req->start.nodeID].dsmBase, req->k, req->op,
+        req->v, v_out, leaf, resp->path, npath);
+    resp->value = v_out;
+    resp->leaf = leaf;
+    resp->npath = npath;
+
+    send = reinterpret_cast<RawMessage *>(resp);
+    // Only transmit the path slots actually written; a shallow resume from a
+    // deep cursor sends almost nothing back.
+    send_len = offsetof(catalyst_wire::TraverseMsg, path) +
+               npath * sizeof(catalyst_wire::PathEntry);
+    break;
+  }
+
   default:
     assert(false);
   }
@@ -139,6 +169,6 @@ void Directory::process_message(const RawMessage *m) {
   if (send) {
     // printf("Send back the message to node %d, app %d\n", m->node_id,
     // m->app_id);
-    dCon->sendMessage2App(send, m->node_id, m->app_id);
+    dCon->sendMessage2App(send, m->node_id, m->app_id, send_len);
   }
 }

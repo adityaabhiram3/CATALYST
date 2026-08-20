@@ -47,8 +47,8 @@ DirectoryConnection::DirectoryConnection(uint16_t dirID, void *dsmPool,
 }
 
 void DirectoryConnection::sendMessage2App(RawMessage *m, uint16_t node_id,
-                                          uint16_t th_id) {
+                                          uint16_t th_id, size_t len) {
   message->sendRawMessage(m, remoteInfo[node_id].appMessageQPN[th_id],
-                          remoteInfo[node_id].dirToAppAh[dirID][th_id]);
+                          remoteInfo[node_id].dirToAppAh[dirID][th_id], len);
   ;
 }

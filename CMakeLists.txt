@@ -30,6 +30,18 @@ set(LINKS_FLAGS "-lcityhash -lboost_system -lboost_coroutine -lpthread -libverbs
 set(INCLUDE_BASE ${PROJECT_SOURCE_DIR}/include)
 include_directories(${INCLUDE_BASE})
 
+# CATALYST standalone tests.
+#
+# Declared before link_libraries(DEX) on purpose: the cursor table has no RDMA
+# dependency, so these build and run without ibverbs/memcached/cityhash. The
+# glob below is non-recursive, so test/catalyst/ is not swept into the DEX
+# test targets.
+file(GLOB CATALYST_TEST_SRC ${PROJECT_SOURCE_DIR}/test/catalyst/*.cpp)
+foreach (CTEST ${CATALYST_TEST_SRC})
+    get_filename_component(CTEST_NAME ${CTEST} NAME_WE)
+    add_executable(${CTEST_NAME} ${CTEST})
+endforeach()
+
 #Source file define
 set(COMMON_SRC ${PROJECT_SOURCE_DIR}/src)
 

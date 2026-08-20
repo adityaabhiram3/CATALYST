@@ -40,7 +40,12 @@
 
 #define ADD_ROUND(x, n) ((x) = ((x) + 1) % (n))
 
-#define MESSAGE_SIZE 96 // byte
+// Size of a slot in the UD message pool, not the number of bytes put on the
+// wire: sendRawMessage transmits sizeof(the message struct), so enlarging this
+// costs pool memory only and does not slow the existing DEX/SMART RPCs. Sized
+// for CATALYST's traverse reply, which carries a recorded path on top of the
+// 40-byte UD GRH (see catalyst_wire::TraverseMsg in RawMessageConnection.h).
+#define MESSAGE_SIZE 512 // byte
 
 #define POST_RECV_PER_RC_QP 128
 

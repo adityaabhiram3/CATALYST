@@ -221,8 +221,17 @@ static void test_capacity_rounding() {
   CHECK(t.probe_point(15).node == 0xC);
 }
 
-static void test_randomized_against_reference() {
-  std::printf("randomized cross-check vs scalar reference\n");
+/* Run the cross-check at an explicit vector width.
+ *
+ * Templated so both lane counts are exercised on any host: GCC materialises a
+ * 64-byte vector even without AVX-512 (splitting it across narrower
+ * registers), so an AVX2 dev box still executes the 8-lane logic that an
+ * AVX-512 machine will run natively. Lane-count bugs would otherwise only
+ * appear on the target cluster. */
+template <int VecBytes>
+static void test_randomized_against_reference(const char *label) {
+  std::printf("randomized cross-check vs scalar reference (%s)\n", label);
+  using Table = CursorTable<uint64_t, VecBytes>;
   std::mt19937_64 rng(0xCA7A1751);
   const size_t kCap = 512;
   Table t(kCap);
@@ -304,7 +313,8 @@ int main() {
   test_narrow_after_split();
   test_key_extremes();
   test_capacity_rounding();
-  test_randomized_against_reference();
+  test_randomized_against_reference<32>("4 lanes, 32B vectors");
+  test_randomized_against_reference<64>("8 lanes, 64B vectors");
   test_footprint_reporting();
 
   std::printf("\n%d checks, %d failures\n", g_checks, g_failures);

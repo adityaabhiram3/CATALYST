@@ -55,28 +55,37 @@ template <typename VecT> inline VecT load(const void *p) {
  */
 template <typename MaskT>
 inline uint32_t lane_bits(MaskT m, int lanes) {
-  uint32_t bits = 0;
-#if defined(__AVX512F__)
-  if (sizeof(MaskT) == 64 && lanes == 8) {
+  // Subscripting a vector yields a reference, hence the decay.
+  using Lane = typename std::decay<decltype(m[0])>::type;
+  constexpr int kN = (int)(sizeof(MaskT) / sizeof(Lane));
+
+  /* These must be `if constexpr`, not `if`. An AVX-512 target also defines
+   * __AVX2__, so both blocks are compiled; with a plain `if` the narrower
+   * branch is still type-checked and casting a 64-byte vector to __m256d is a
+   * hard error even though that branch can never be taken. */
+#if defined(__AVX512DQ__)
+  // movepi64_mask is AVX512DQ, not plain AVX512F; an F-only target falls
+  // through to the generic path below rather than failing to compile.
+  if constexpr (sizeof(MaskT) == 64 && sizeof(Lane) == 8) {
     return (uint32_t)_mm512_movepi64_mask((__m512i)m);
-  }
+  } else
 #endif
 #if defined(__AVX2__)
-  if (sizeof(MaskT) == 32 && lanes == 4) {
+  if constexpr (sizeof(MaskT) == 32 && sizeof(Lane) == 8) {
     return (uint32_t)_mm256_movemask_pd((__m256d)m);
-  }
+  } else
 #endif
   {
-    // Generic: read back the lanes and test each sign bit.
-    // Subscripting a vector yields a reference, hence the decay.
-    using Lane = typename std::decay<decltype(m[0])>::type;
-    alignas(64) Lane tmp[sizeof(MaskT) / sizeof(Lane)];
+    // Generic: read the lanes back and test each sign bit. Lanes are all-ones
+    // or all-zero, so a nonzero test is sufficient. -O3 often recognises this.
+    uint32_t bits = 0;
+    alignas(64) Lane tmp[kN];
     std::memcpy(tmp, &m, sizeof(MaskT));
     for (int i = 0; i < lanes; ++i) {
       bits |= (tmp[i] != 0) ? (1u << i) : 0u;
     }
+    return bits;
   }
-  return bits;
 }
 
 // Iterate set bits low-to-high: while (bits) { int i = next_lane(bits); ... }

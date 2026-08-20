@@ -61,8 +61,11 @@ echo "=== index=$INDEX nodes=$NODES threads=$THREADS (kMaxThread=$KMAXTHREAD)"
 echo "=== compute nodes = ceil($THREADS/$KMAXTHREAD) = $(( (THREADS + KMAXTHREAD - 1) / KMAXTHREAD ))"
 echo "=== mix r/i/u/d/s = $READ/$INSERT/$UPDATE/$DELETE/$RANGE  bulk=${BULK}M ops=${RUNNUM}M"
 
-# Node 0 owns memcached; this node just joins.
-sleep 2
+# Node 0 owns memcached init (flush + counter reset); this node must not touch
+# it. Start node 0 first and wait until it prints "dir 0 launch!" before
+# launching this -- node 0 resets barrier-DSM-init just after that point, and
+# incrementing the barrier before the reset is what wedges startup.
+sleep 5
 
 sudo ./newbench $NODES $READ $INSERT $UPDATE $DELETE $RANGE \
      $THREADS $MEMTHREADS $CACHE $UNIFORM $ZIPF \

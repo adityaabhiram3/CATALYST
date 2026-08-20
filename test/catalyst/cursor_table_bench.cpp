@@ -149,6 +149,20 @@ int main() {
   std::printf("%10s %10s %12s %12s %12s\n", "", "(KB)", "(ns/probe)",
               "scanned", "");
 
+  /* Two passes on purpose.
+   *
+   * The partitioned probe reads 8KB and is L1-resident, so it is sensitive to
+   * whatever else has recently touched the cache. Building and probing a
+   * multi-megabyte flat table in the same loop iteration perturbed it by ~40%
+   * on the dev box. Measure every partitioned configuration first, then go
+   * back and measure the flat baselines, so the headline number is taken under
+   * the same conditions whether or not the comparison runs. */
+  struct Row {
+    size_t installed, footprint, capacity, probe_slots;
+    double ns;
+  };
+  std::vector<Row> rows;
+
   for (int bits : {4, 5, 6, 7, 8}) {
     using Bucketed = catalyst::BucketedCursorTable<uint64_t>;
     Bucketed bt(bits, 256, 256, 4);
@@ -182,13 +196,39 @@ int main() {
         },
         kProbes);
 
-    // What a flat table of the same capacity would have cost, at the measured
-    // scan bandwidth of ~35 GB/s.
-    const double flat_ns = (double)bt.capacity() * 16.0 / 35.0;
+    rows.push_back(Row{installed, bt.footprint_bytes(), bt.capacity(),
+                       bt.probe_slots(), ns});
+  }
 
-    std::printf("%10zu %10.0f %12.1f %12zu %11.0fx\n", installed,
-                bt.footprint_bytes() / 1024.0, ns, bt.probe_slots(),
-                flat_ns / ns);
+  /* Second pass: what a flat table of the same capacity actually costs.
+   *
+   * Measured rather than estimated. An earlier version divided by a hardcoded
+   * 35 GB/s taken from one machine, but scan bandwidth varies by more than
+   * 1.5x across hosts -- a Xeon Gold 6242R sustains ~23 GB/s where an i9-9900K
+   * reaches ~35 -- so the estimate understated the win on exactly the hardware
+   * that matters. */
+  for (auto &r : rows) {
+    Table flat(r.capacity);
+    std::mt19937_64 flat_rng(4242);
+    for (size_t i = 0; i < flat.capacity(); ++i) {
+      const uint64_t lo = key_d(flat_rng) % (kKeySpace / 2);
+      flat.install_at(i, lo, lo + (kKeySpace >> 10), 0x3000 + i, 1,
+                      (uint8_t)(2 + (i % 10)));
+    }
+    volatile uint64_t sink = 0;
+    const int flat_probes = 200; // one probe is ~50us at the larger capacities
+    for (int i = 0; i < 10; ++i) sink ^= flat.probe_point(keys[i]).node;
+    const double flat_ns = time_ns_per_op(
+        [&] {
+          uint64_t acc = 0;
+          for (int i = 0; i < flat_probes; ++i)
+            acc ^= flat.probe_point(keys[i]).node;
+          sink ^= acc;
+        },
+        flat_probes);
+
+    std::printf("%10zu %10.0f %12.1f %12zu %11.0fx\n", r.installed,
+                r.footprint / 1024.0, r.ns, r.probe_slots, flat_ns / r.ns);
   }
 
   std::printf("\nnote: probe cost is set by slots_per_bucket + overflow_slots,\n"

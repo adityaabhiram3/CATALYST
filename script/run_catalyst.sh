@@ -61,6 +61,21 @@ echo "=== index=$INDEX nodes=$NODES threads=$THREADS (kMaxThread=$KMAXTHREAD)"
 echo "=== compute nodes = ceil($THREADS/$KMAXTHREAD) = $(( (THREADS + KMAXTHREAD - 1) / KMAXTHREAD ))"
 echo "=== mix r/i/u/d/s = $READ/$INSERT/$UPDATE/$DELETE/$RANGE  bulk=${BULK}M ops=${RUNNUM}M"
 
+# Wipe stale memcached state before restartMemc.sh re-initialises the counters.
+#
+# DSMKeeper::barrier() has node 0 reset barrier-<name> to 0 and every node then
+# increment it, so a leftover value from an aborted run desynchronises startup:
+# if barrier-DSM-init still holds 1, node 1 increments to 2, sees the target and
+# proceeds, while node 0 resets to 0, reaches 1, and waits forever. restartMemc
+# normally avoids this by relaunching memcached, but when the ssh to the
+# memcached host is refused it only resets serverNum/clientNum -- every
+# barrier-* key survives. Flushing first is what makes a run repeatable.
+# Must run BEFORE restartMemc.sh, which sets serverNum/clientNum afterwards.
+MEMC_ADDR=$(head -1 ../memcached.conf)
+MEMC_PORT=$(awk 'NR==2{print}' ../memcached.conf)
+echo "=== flushing memcached at ${MEMC_ADDR}:${MEMC_PORT}"
+printf 'flush_all\r\nquit\r\n' | nc "${MEMC_ADDR}" "${MEMC_PORT}"
+
 ./restartMemc.sh
 
 sudo ./newbench $NODES $READ $INSERT $UPDATE $DELETE $RANGE \

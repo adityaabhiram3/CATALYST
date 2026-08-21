@@ -57,6 +57,21 @@ TUNE=${TUNE:-0}
 # ~1.9MB and prints its real footprint at startup.
 CACHE=${CACHE:-256}
 
+# ---- CATALYST pattern model (Sec. 5) ----------------------------------------
+# PATTERN: funnel | interval | branch (alias: spatial) | auto
+#   funnel   deep-narrow convergence  -- skewed point lookups, PageRank hubs
+#   interval shallow-wide reach       -- range queries and scans
+#   branch   pivot-bounded clusters   -- scattered multi-path, BFS frontiers
+#   auto     let the control loop pick from the measured feedback
+# MODEL=0 falls back to the fixed Sec. 4 envelope, the A/B baseline for
+# "does the control loop earn its place".
+export CATALYST_PATTERN=${PATTERN:-funnel}
+export CATALYST_TAU=${TAU:-0}
+export CATALYST_MODEL=${MODEL:-1}
+# Records per range/scan op: ~100 = range query, ~10000+ = scan (Sec. 6).
+export CATALYST_SCAN_LEN=${SCAN_LEN:-100}
+
+echo "=== pattern=$CATALYST_PATTERN tau=$CATALYST_TAU model=$CATALYST_MODEL scan_len=$CATALYST_SCAN_LEN"
 echo "=== index=$INDEX nodes=$NODES threads=$THREADS (kMaxThread=$KMAXTHREAD)"
 echo "=== compute nodes = ceil($THREADS/$KMAXTHREAD) = $(( (THREADS + KMAXTHREAD - 1) / KMAXTHREAD ))"
 echo "=== mix r/i/u/d/s = $READ/$INSERT/$UPDATE/$DELETE/$RANGE  bulk=${BULK}M ops=${RUNNUM}M"
@@ -78,7 +93,14 @@ printf 'flush_all\r\nquit\r\n' | nc "${MEMC_ADDR}" "${MEMC_PORT}"
 
 ./restartMemc.sh
 
-sudo ./newbench $NODES $READ $INSERT $UPDATE $DELETE $RANGE \
+# `sudo env VAR=...` rather than plain sudo: sudo sanitises the environment, so
+# exported CATALYST_* vars would silently not reach the process and the run
+# would quietly use defaults. Going through env is immune to sudoers policy.
+sudo env CATALYST_PATTERN="$CATALYST_PATTERN" \
+         CATALYST_TAU="$CATALYST_TAU" \
+         CATALYST_MODEL="$CATALYST_MODEL" \
+         CATALYST_SCAN_LEN="$CATALYST_SCAN_LEN" \
+     ./newbench $NODES $READ $INSERT $UPDATE $DELETE $RANGE \
      $THREADS $MEMTHREADS $CACHE $UNIFORM $ZIPF \
      $BULK $WARMUP $RUNNUM \
      $CORRECT $TIMEBASE $EARLY $INDEX $RPC $ADMIT $TUNE $KMAXTHREAD

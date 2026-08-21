@@ -97,6 +97,14 @@ std::vector<double> rpc_rate_vec = {1};
 std::vector<uint64_t> throughput_vec;
 std::vector<uint64_t> straggler_throughput_vec;
 
+/* Records touched per range/scan operation.
+ *
+ * Sec. 6 separates range queries (10-1000 records) from scans (10^4-10^6);
+ * newbench previously fixed this at 100, which made the two workloads
+ * identical. Set from CATALYST_SCAN_LEN so the 22-argument list is unchanged.
+ */
+uint32_t scan_len = 100;
+
 int auto_tune = 0;
 int run_times = 1;
 int cur_run = 0;
@@ -157,7 +165,7 @@ void thread_run(int id) {
   //        sizeof(uint64_t) * thread_warmup_num);
   size_t counter = 0;
   size_t success_counter = 0;
-  uint32_t scan_num = 100;
+  uint32_t scan_num = scan_len;
   std::pair<Key, Value> *result = new std::pair<Key, Value>[scan_num];
 
   while (counter < thread_warmup_num) {
@@ -410,6 +418,19 @@ void parse_args(int argc, char *argv[]) {
                               // multiple times for a single operation
 
   kMaxThread = atoi(argv[22]);
+
+  if (const char *sl = std::getenv("CATALYST_SCAN_LEN")) {
+    const long v = std::atol(sl);
+    // Each worker allocates scan_len pairs up front, so a 10^6 scan costs
+    // ~16MB per thread; refuse a value that would dwarf the machine.
+    if (v > 0 && v <= (1L << 21)) {
+      scan_len = (uint32_t)v;
+    } else {
+      std::cout << "CATALYST_SCAN_LEN out of range (1.." << (1L << 21)
+                << "), keeping " << scan_len << std::endl;
+    }
+  }
+  std::cout << "scan_len = " << scan_len << " records/range-op" << std::endl;
   // How to make insert ready?
   kKeySpace = bulk_load_num +
               ceil((op_num + warmup_num) * (kInsertRatio / 100.0)) + 1000;
@@ -512,7 +533,10 @@ void generate_index() {
     sharding.push_back(std::numeric_limits<Key>::max());
     assert(sharding.size() == static_cast<size_t>(cluster_num) + 1);
 
-    catalyst::CursorConfig cfg;
+    // Pattern model is selected by CATALYST_PATTERN / CATALYST_TAU /
+    // CATALYST_MODEL so a workload sweep needs no rebuild and no change to
+    // newbench's fixed 22-argument list.
+    auto cfg = catalyst::CursorConfig::from_env();
     // cache_mb is reinterpreted for this index: it sizes the DEX fallback
     // cache used for bulk load and leaf splits, NOT CATALYST's own state.
     // The cursor table is fixed at its ~2MB default; see catalyst_tree.h.

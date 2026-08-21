@@ -33,8 +33,10 @@
 #include "../tree/leanstore_tree.h"
 #include "../tree_api.h"
 #include "bucketed_cursor_table.h"
+#include "pattern.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -62,7 +64,29 @@ struct CursorConfig {
   size_t slots_per_bucket = 256;
   size_t overflow_slots = 256;
   int max_span = 4;
-  Envelope envelope{};
+  Envelope envelope{};        // only used when the control loop is disabled
+  ControlConfig control{};    // Sec. 5 pattern model
+  bool use_pattern_model = true;
+
+  /* Read from the environment so a workload sweep needs no rebuild and no
+   * change to newbench's fixed 22-argument list:
+   *   CATALYST_PATTERN = funnel | interval | branch | spatial | auto
+   *   CATALYST_TAU     = admission margin (default 0)
+   *   CATALYST_MODEL   = 0 to fall back to the fixed Sec. 4 envelope
+   */
+  static CursorConfig from_env() {
+    CursorConfig c;
+    if (const char *p = std::getenv("CATALYST_PATTERN")) {
+      c.control.pattern = pattern_from_string(p);
+    }
+    if (const char *t = std::getenv("CATALYST_TAU")) {
+      c.control.tau = std::atof(t);
+    }
+    if (const char *m = std::getenv("CATALYST_MODEL")) {
+      c.use_pattern_model = (std::atoi(m) != 0);
+    }
+    return c;
+  }
 };
 
 template <class Key, class Value> class BTree : public tree_api<Key, Value> {
@@ -76,9 +100,10 @@ public:
   BTree(DSM *dsm, uint64_t tree_id, uint64_t dex_cache_mb,
         std::vector<Key> &partition, int num_partitions,
         const CursorConfig &cfg = CursorConfig())
-      : dsm_(dsm), env_(cfg.envelope),
+      : dsm_(dsm), cfg_(cfg), env_(cfg.envelope),
         cursors_(cfg.bucket_bits, cfg.slots_per_bucket, cfg.overflow_slots,
-                 cfg.max_span) {
+                 cfg.max_span),
+        ctrls_(MAX_APP_THREAD, Slot{Controller(cfg.control)}) {
     // rpc_rate 0 / admission 1: the embedded tree is only a builder and a
     // split path, so its own pushdown heuristics must stay out of the way.
     dex_ = new cachepush::BTree<Key, Value>(dsm, tree_id, dex_cache_mb, 0.0, 1.0,
@@ -90,6 +115,14 @@ public:
               << (int)env_.max_level << "]" << std::endl;
     std::cout << "CATALYST: DEX fallback cache " << dex_cache_mb << " MB"
               << std::endl;
+    if (cfg_.use_pattern_model) {
+      std::cout << "CATALYST: pattern model ON, pattern="
+                << pattern_name(cfg_.control.pattern)
+                << " tau=" << cfg_.control.tau << std::endl;
+    } else {
+      std::cout << "CATALYST: pattern model OFF (fixed Sec. 4 envelope)"
+                << std::endl;
+    }
   }
 
   ~BTree() { delete dex_; }
@@ -192,6 +225,10 @@ public:
   void reset_buffer_pool(bool flush_dirty) override {
     dex_->reset_buffer_pool(flush_dirty);
     cursors_.clear();
+    // The descriptor and the confidence sketch describe a table that no longer
+    // exists, so they have to go too or the controller spends the next phase
+    // acting on evidence about evicted cursors.
+    for (auto &s : ctrls_) s.c.reset();
     hits_ = misses_ = stale_ = cross_ = 0;
   }
 
@@ -206,6 +243,18 @@ public:
                 probes,
                 probes ? 100.0 * (double)hits_ / (double)probes : 0.0, stale_,
                 cross_, smo_fallbacks_, cursors_.size(), cursors_.capacity());
+    if (cfg_.use_pattern_model) {
+      const Controller &c = ctrls_[0].c;
+      const auto &d = c.descriptor();
+      const auto &f = c.feedback();
+      std::printf("CATALYST: pattern=%s theta{funnel[%u,%u] anchor=%u "
+                  "pivot=%u/h%u b=%u} ewma{hit=%.2f skip=%.2f residual=%.2f} "
+                  "admit=%lu reject=%lu switches=%u root_level=%u\n",
+                  pattern_name(c.kind()), d.d_start, d.d_end, d.d_anchor,
+                  d.d_pivot, d.branch_height, d.breadth, f.hit.get(),
+                  f.skipped.get(), f.residual.get(), f.admits, f.rejects,
+                  c.pattern_switches(), c.root_level());
+    }
   }
 
   // CATALYST's actual compute-side footprint, for Sec. 6.3 comparisons.
@@ -227,12 +276,23 @@ private:
   static uint8_t depth_of(uint8_t level) {
     return (uint8_t)(kDepthBias - (level < kDepthBias ? level : kDepthBias));
   }
+  // Inverse, so a resident cursor's stored depth can be turned back into a DEX
+  // level and then into the controller's paper depth.
+  static uint8_t level_of(uint8_t stored_depth) {
+    return (uint8_t)(stored_depth <= kDepthBias ? kDepthBias - stored_depth : 0);
+  }
 
   /* One index operation: probe, traverse, capture (Fig. 8). */
   int run(Key k, Value v_in, Op op, Value &v_out, GlobalAddress &leaf_out) {
     Cursor<Key> c = cursors_.probe_point(k);
     bool holding_cursor = c.valid();
     holding_cursor ? ++hits_ : ++misses_;
+    if (cfg_.use_pattern_model) ctrl().note_probe(holding_cursor);
+
+    // How far down the tree this query gets to start, in the controller's
+    // depth convention -- this is exactly the "levels skipped" feedback signal.
+    const uint8_t resumed_depth =
+        holding_cursor ? ctrl().to_depth(level_of(c.depth)) : 0;
 
     GlobalAddress start =
         holding_cursor ? GlobalAddress(c.node) : current_root();
@@ -266,7 +326,7 @@ private:
 
       // Partial paths are still valid cursor candidates, so capture before
       // following the operation onto the next memory node.
-      install_path(msg);
+      install_path(msg, k, c, holding_cursor ? resumed_depth : 0);
 
       if (msg.status == catalyst_wire::kCrossNode) {
         ++cross_;
@@ -281,19 +341,56 @@ private:
     return catalyst_wire::kStale;
   }
 
-  /* Admission (Sec. 4.1): three range checks against integers already present
-   * in the reply. Candidates outside the envelope are dropped here, so a
-   * bounded table never fills with placements the workload cannot use. */
-  void install_path(const Msg &msg) {
-    const uint8_t n =
-        msg.npath < catalyst_wire::kMaxPathLen ? msg.npath : catalyst_wire::kMaxPathLen;
-    for (uint8_t i = 0; i < n; ++i) {
-      const auto &p = msg.path[i];
-      if (p.addr == GlobalAddress::Null()) continue;
-      if (!env_.admits(p)) continue;
-      if (p.lo > p.hi) continue;
-      cursors_.install(p.lo, p.hi, p.addr.val, 0, depth_of(p.level));
+  /* Capture (Sec. 4.1) plus admission.
+   *
+   * With the pattern model on this is the Sec. 5 loop: feed the returned path
+   * into the confidence sketch, let the controller move theta, pick the single
+   * best candidate inside the admissible region, and admit it only if it beats
+   * the resident cursor by tau. Admitting one cursor per query rather than the
+   * whole path is what keeps a bounded table selective.
+   *
+   * With the model off this degrades to the fixed envelope of Sec. 4, which is
+   * the A/B baseline for "does the control loop actually earn its place". */
+  void install_path(const Msg &msg, Key k, const Cursor<Key> &resident,
+                    uint8_t resumed_depth) {
+    const uint8_t n = msg.npath < catalyst_wire::kMaxPathLen
+                          ? msg.npath
+                          : catalyst_wire::kMaxPathLen;
+    if (n == 0) return;
+
+    if (!cfg_.use_pattern_model) {
+      for (uint8_t i = 0; i < n; ++i) {
+        const auto &p = msg.path[i];
+        if (p.addr == GlobalAddress::Null()) continue;
+        if (!env_.admits(p)) continue;
+        if (p.lo > p.hi) continue;
+        cursors_.install(p.lo, p.hi, p.addr.val, 0, depth_of(p.level));
+      }
+      return;
     }
+
+    Controller &c = ctrl();
+    c.observe(msg.path, n, resumed_depth);
+
+    catalyst_wire::PathEntry best{};
+    uint8_t best_depth = 0;
+    const size_t occ = cursors_.bucket_occupancy(cursors_.bucket_of(k));
+    if (!c.select(msg.path, n, occ, best, best_depth)) return;
+    if (best.addr == GlobalAddress::Null() || best.lo > best.hi) return;
+    const uint64_t res_node = resident.valid() ? resident.node : kNoNode;
+    const uint8_t res_depth =
+        resident.valid() ? c.to_depth(level_of(resident.depth)) : 0;
+    if (!c.admit(best.addr.val, best_depth, res_node, res_depth)) return;
+
+    if (cursors_.install(best.lo, best.hi, best.addr.val, 0,
+                         depth_of(best.level))) {
+      c.note_admitted_width(best.hi - best.lo);
+    }
+  }
+
+  Controller &ctrl() {
+    const int id = dsm_->getMyThreadID();
+    return ctrls_[(id >= 0 && id < (int)ctrls_.size()) ? id : 0].c;
   }
 
   GlobalAddress current_root() const { return dex_->root; }
@@ -302,10 +399,19 @@ private:
   // later be written back over a server-side mutation.
   void flush_dex_cache() { dex_->flush_all(); }
 
+  // One controller per worker thread, cache-line separated. The cursor table
+  // is shared; the descriptor and feedback are per-thread estimates of that
+  // thread's query mix, which matches DEX's per-thread key partitioning.
+  struct alignas(64) Slot {
+    Controller c;
+  };
+
   DSM *dsm_;
   cachepush::BTree<Key, Value> *dex_;
+  CursorConfig cfg_;
   Envelope env_;
   BucketedCursorTable<Key> cursors_;
+  std::vector<Slot> ctrls_;
 
   uint64_t hits_ = 0, misses_ = 0, stale_ = 0, cross_ = 0, smo_fallbacks_ = 0;
 };

@@ -57,6 +57,15 @@ TUNE=${TUNE:-0}
 # ~1.9MB and prints its real footprint at startup.
 CACHE=${CACHE:-256}
 
+# Must match node 0 -- the pattern is per-process, so a mismatch makes the two
+# compute nodes run different policies against the same tree.
+export CATALYST_PATTERN=${PATTERN:-funnel}
+export CATALYST_TAU=${TAU:-0}
+export CATALYST_MODEL=${MODEL:-1}
+# Records per range/scan op: ~100 = range query, ~10000+ = scan (Sec. 6).
+export CATALYST_SCAN_LEN=${SCAN_LEN:-100}
+
+echo "=== pattern=$CATALYST_PATTERN tau=$CATALYST_TAU model=$CATALYST_MODEL scan_len=$CATALYST_SCAN_LEN"
 echo "=== index=$INDEX nodes=$NODES threads=$THREADS (kMaxThread=$KMAXTHREAD)"
 echo "=== compute nodes = ceil($THREADS/$KMAXTHREAD) = $(( (THREADS + KMAXTHREAD - 1) / KMAXTHREAD ))"
 echo "=== mix r/i/u/d/s = $READ/$INSERT/$UPDATE/$DELETE/$RANGE  bulk=${BULK}M ops=${RUNNUM}M"
@@ -67,7 +76,14 @@ echo "=== mix r/i/u/d/s = $READ/$INSERT/$UPDATE/$DELETE/$RANGE  bulk=${BULK}M op
 # incrementing the barrier before the reset is what wedges startup.
 sleep 5
 
-sudo ./newbench $NODES $READ $INSERT $UPDATE $DELETE $RANGE \
+# `sudo env VAR=...` rather than plain sudo: sudo sanitises the environment, so
+# exported CATALYST_* vars would silently not reach the process and the run
+# would quietly use defaults. Going through env is immune to sudoers policy.
+sudo env CATALYST_PATTERN="$CATALYST_PATTERN" \
+         CATALYST_TAU="$CATALYST_TAU" \
+         CATALYST_MODEL="$CATALYST_MODEL" \
+         CATALYST_SCAN_LEN="$CATALYST_SCAN_LEN" \
+     ./newbench $NODES $READ $INSERT $UPDATE $DELETE $RANGE \
      $THREADS $MEMTHREADS $CACHE $UNIFORM $ZIPF \
      $BULK $WARMUP $RUNNUM \
      $CORRECT $TIMEBASE $EARLY $INDEX $RPC $ADMIT $TUNE $KMAXTHREAD

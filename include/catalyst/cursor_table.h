@@ -10,17 +10,7 @@
  * they are kept separate from the payload: a scan touches 2 x 8B per entry
  * instead of 29B. node_/epoch_/depth_ are gathered only for matching lanes.
  *
- * This is the flat arena. Scanning all of it is Theta(capacity), which meets
- * the sub-100ns budget of Fig. 8 only up to a few hundred cursors; see
- * BucketedCursorTable in bucketed_cursor_table.h for the partitioned table
- * used at the 2-4MB footprints of Sec. 6.3. The arena exposes region-limited
- * scans (scan_point / scan_range) so the bucketed layer reuses this kernel
- * verbatim on one bucket at a time.
- *
- * Deviation from Fig. 9: match extraction uses ctz over the lane bitmask
- * rather than a bitmap->offset LUT. Matches are sparse (a handful of nested
- * bands contain any given key), so ctz beats a 2^lanes table lookup and needs
- * no precomputed state. The vectorized compare is unchanged.
+
  *
  * Concurrency: probes are lock-free and tolerate races. Bands are retired
  * before the payload is rewritten and published after, so a concurrent reader
